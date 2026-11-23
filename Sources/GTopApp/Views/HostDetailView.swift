@@ -27,10 +27,25 @@ struct HostDetailView: View {
                         statusDiagnosticCard(host)
                     }
 
-                    if host.status.isOnline && !host.gpus.isEmpty {
-                        gpuCardsSection(host)
-                        GPUDetailChartsPanel(host: host, selectedGPUID: selectedGPUID)
-                        processTableSection(host)
+                    if host.status.isOnline {
+                        if let slurm = host.slurm {
+                            SlurmHostDetailView(
+                                store: store,
+                                host: host,
+                                slurm: slurm,
+                                onNotify: onNotify
+                            )
+                        }
+                        if !host.gpus.isEmpty {
+                            if host.slurm != nil {
+                                Divider()
+                                Text("本机直连 GPU")
+                                    .font(.title3.weight(.bold))
+                            }
+                            gpuCardsSection(host)
+                            GPUDetailChartsPanel(host: host, selectedGPUID: selectedGPUID)
+                            processTableSection(host)
+                        }
                     }
                 }
                 .padding(20)
@@ -63,6 +78,10 @@ struct HostDetailView: View {
                         text: host.status.label,
                         color: GTopTheme.statusColor(host.status)
                     )
+
+                    if host.isSlurmCluster {
+                        BadgePill(text: "Slurm 集群", color: .purple, icon: "square.stack.3d.up")
+                    }
 
                     if isEditingGroup {
                         HStack(spacing: 4) {

@@ -30,7 +30,7 @@ struct SidebarView: View {
                         HStack {
                             Label("空闲 GPU", systemImage: "sparkles")
                             Spacer()
-                            let idleCount = store.idleGPUs.count
+                            let idleCount = store.totalFreeGPUCount
                             if idleCount > 0 {
                                 Text("\(idleCount)")
                                     .font(.caption2.weight(.semibold))
@@ -43,6 +43,28 @@ struct SidebarView: View {
                                 Text("0")
                                     .font(.caption2)
                                     .foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
+
+                    if !store.onlineSlurmHosts.isEmpty {
+                        NavigationLink(value: SidebarDestination.slurmJobs) {
+                            HStack {
+                                Label("Slurm 作业", systemImage: "square.stack.3d.up")
+                                Spacer()
+                                if store.mySlurmJobCount > 0 {
+                                    Text("我 \(store.mySlurmJobCount)")
+                                        .font(.caption2.weight(.semibold))
+                                        .monospacedDigit()
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Color.purple.opacity(0.18), in: Capsule())
+                                        .foregroundStyle(.purple)
+                                }
+                                Text("\(store.allSlurmJobs.count)")
+                                    .font(.caption2.weight(.medium))
+                                    .foregroundStyle(.secondary)
+                                    .monospacedDigit()
                             }
                         }
                     }
@@ -240,10 +262,25 @@ private struct HostSidebarRow: View {
             StatusDot(status: host.status, size: 7)
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(host.config.alias)
-                    .font(.callout.weight(.medium))
-                    .lineLimit(1)
-                if host.status.isOnline {
+                HStack(spacing: 4) {
+                    Text(host.config.alias)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                    if host.isSlurmCluster {
+                        Text("Slurm")
+                            .font(.system(size: 9, weight: .semibold))
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.purple.opacity(0.18), in: Capsule())
+                            .foregroundStyle(.purple)
+                    }
+                }
+                if let slurm = host.slurm, host.status.isOnline {
+                    Text("\(slurm.freeGPUs)/\(slurm.totalGPUs) 空 · \(slurm.runningJobs.count)R")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                } else if host.status.isOnline {
                     Text("\(host.gpus.count) GPU · \(Formatters.percent(host.averageGPUUtilization))")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -258,7 +295,17 @@ private struct HostSidebarRow: View {
 
             Spacer(minLength: 4)
 
-            if host.status.isOnline && !host.gpus.isEmpty {
+            if let slurm = host.slurm, host.status.isOnline, !slurm.gpuNodes.isEmpty {
+                HStack(alignment: .bottom, spacing: 2) {
+                    ForEach(slurm.gpuNodes.prefix(8)) { node in
+                        let frac = max(0.14, min(1.0, node.gpuAllocationPercent / 100.0))
+                        RoundedRectangle(cornerRadius: 1.5)
+                            .fill(GTopTheme.slurmNodeColor(node.stateCategory))
+                            .frame(width: 3.5, height: 14 * frac)
+                    }
+                }
+                .frame(height: 14, alignment: .bottom)
+            } else if host.status.isOnline && !host.gpus.isEmpty {
                 MiniGPUHeatBars(gpus: host.gpus, maxHeight: 14, barWidth: 3.5)
             }
         }

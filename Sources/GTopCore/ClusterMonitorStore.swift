@@ -58,6 +58,10 @@ public final class ClusterMonitorStore {
         monitoredHostStates.filter { $0.status.isOnline }.count
     }
 
+    public var onlineSlurmHosts: [HostMonitorState] {
+        monitoredHostStates.filter { $0.status.isOnline && $0.isSlurmCluster }
+    }
+
     public var allOnlineGPUs: [(host: HostMonitorState, gpu: GPUMetric)] {
         monitoredHostStates
             .filter { $0.status.isOnline }
@@ -68,14 +72,48 @@ public final class ClusterMonitorStore {
         allOnlineGPUs.filter { $0.gpu.isIdle(threshold: settings.idleThreshold) }
     }
 
+    public var slurmFreeNodes: [(host: HostMonitorState, node: SlurmNodeMetric)] {
+        onlineSlurmHosts.flatMap { host in
+            (host.slurm?.freeGPUNodes ?? []).map { (host: host, node: $0) }
+        }
+    }
+
+    public var slurmTotalGPUCount: Int {
+        onlineSlurmHosts.reduce(0) { $0 + ($1.slurm?.totalGPUs ?? 0) }
+    }
+
+    public var slurmFreeGPUCount: Int {
+        onlineSlurmHosts.reduce(0) { $0 + ($1.slurm?.freeGPUs ?? 0) }
+    }
+
+    public var slurmAllocatedGPUCount: Int {
+        onlineSlurmHosts.reduce(0) { $0 + ($1.slurm?.allocatedGPUs ?? 0) }
+    }
+
+    public var allSlurmJobs: [(host: HostMonitorState, job: SlurmJobMetric)] {
+        onlineSlurmHosts.flatMap { host in
+            (host.slurm?.jobs ?? []).map { (host: host, job: $0) }
+        }
+    }
+
+    public var mySlurmJobCount: Int {
+        onlineSlurmHosts.reduce(0) { $0 + ($1.slurm?.myJobs.count ?? 0) }
+    }
+
     public var allProcesses: [(host: HostMonitorState, gpu: GPUMetric, process: GPUProcess)] {
         allOnlineGPUs.flatMap { item in
             item.gpu.processes.map { (host: item.host, gpu: item.gpu, process: $0) }
         }
     }
 
+    /// Combined count of Direct GPUs + Slurm-managed GPUs across all online hosts
     public var totalGPUCount: Int {
-        allOnlineGPUs.count
+        allOnlineGPUs.count + slurmTotalGPUCount
+    }
+
+    /// Combined count of Direct idle GPUs + Slurm free schedulable GPUs
+    public var totalFreeGPUCount: Int {
+        idleGPUs.count + slurmFreeGPUCount
     }
 
     public var averageClusterGPUUtilization: Double {
@@ -111,8 +149,12 @@ public final class ClusterMonitorStore {
         return buckets.keys.sorted().map { name in
             let hosts = buckets[name] ?? []
             let online = hosts.filter { $0.status.isOnline }
-            let totalGPUs = online.reduce(0) { $0 + $1.gpus.count }
-            let freeGPUs = online.reduce(0) { $0 + $1.idleGPUs(threshold: settings.idleThreshold).count }
+            let totalGPUs = online.reduce(0) { $0 + $1.totalManagedGPUCount }
+            let freeGPUs = online.reduce(0) { acc, host in
+                let directFree = host.idleGPUs(threshold: settings.idleThreshold).count
+                let slurmFree = host.slurm?.freeGPUs ?? 0
+                return acc + directFree + slurmFree
+            }
             return GroupSummary(
                 name: name,
                 totalHosts: hosts.count,
@@ -163,6 +205,7 @@ public final class ClusterMonitorStore {
         inFlightHosts.removeAll()
         if isDemoMode {
             demoOverrides = [
+                "slurm-hpc-login": .forceEnable,
                 "gpu-h100-01": .forceEnable,
                 "gpu-a100-02": .forceEnable,
                 "lab-4090-workstation": .forceEnable,
@@ -378,6 +421,29 @@ public final class ClusterMonitorStore {
         await pollSingleHost(alias: alias)
     }
 
+    /// On-demand live `nvidia-smi` drill-down for a specific Slurm compute node or running job.
+    public func probeSlurmNodeLiveGPU(
+        loginAlias: String,
+        nodeName: String,
+        jobID: String?
+    ) async throws -> SlurmLiveNodeSnapshot {
+        if isDemoMode {
+            demoTick += 1
+            return demoProvider.generateDemoSlurmNodeLiveSnapshot(
+                nodeName: nodeName,
+                jobID: jobID,
+                tick: demoTick
+            )
+        }
+        return try await sshClient.probeSlurmNodeLiveGPU(
+            loginAlias: loginAlias,
+            nodeName: nodeName,
+            jobID: jobID,
+            sshConfigPath: settings.sshConfigPath,
+            timeoutSeconds: max(8.0, settings.sshTimeoutSeconds)
+        )
+    }
+
     public func shutdown() {
         pollLoopTask?.cancel()
         pollLoopTask = nil
@@ -488,7 +554,9 @@ public final class ClusterMonitorStore {
         case .success(let snapshot):
             updated.status = .online
             updated.remoteHostname = snapshot.remoteHostname
+            updated.remoteUsername = snapshot.remoteUsername
             updated.gpus = snapshot.gpus
+            updated.slurm = snapshot.slurm
             updated.latencyMs = snapshot.latencyMs
             updated.lastUpdated = snapshot.timestamp
             updated.consecutiveFailures = 0
@@ -510,10 +578,22 @@ public final class ClusterMonitorStore {
                 updated.historyByGPU[gpu.id] = series
             }
 
+            let hostLoadPercent: Double
+            let hostMemPercent: Double
+            if let slurm = snapshot.slurm, slurm.totalGPUs > 0 {
+                hostLoadPercent = slurm.allocationPercent
+                let totalMem = slurm.gpuNodes.reduce(0) { $0 + $1.memoryTotalMiB }
+                let allocMem = slurm.gpuNodes.reduce(0) { $0 + $1.memoryAllocatedMiB }
+                hostMemPercent = totalMem > 0 ? (Double(allocMem) / Double(totalMem)) * 100.0 : 0
+            } else {
+                hostLoadPercent = updated.averageGPUUtilization
+                hostMemPercent = updated.memoryPercent
+            }
+
             let hostSample = GPUSamplePoint(
                 timestamp: snapshot.timestamp,
-                gpuUtilization: updated.averageGPUUtilization,
-                memoryPercent: updated.memoryPercent,
+                gpuUtilization: hostLoadPercent,
+                memoryPercent: hostMemPercent,
                 temperatureC: updated.maxTemperatureC ?? 0,
                 powerDrawW: updated.totalPowerDrawW,
                 fanSpeedPercent: nil
@@ -529,6 +609,7 @@ public final class ClusterMonitorStore {
             if let smiError = error as? NvidiaSMIParseError, smiError == .noNvidiaSMI {
                 updated.status = .noGPU
                 updated.gpus = []
+                updated.slurm = nil
             } else {
                 updated.status = .error(error.localizedDescription)
             }

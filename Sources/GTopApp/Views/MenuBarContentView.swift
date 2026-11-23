@@ -41,13 +41,17 @@ struct MenuBarContentView: View {
                 )
                 miniStat(
                     title: "空闲 GPU",
-                    value: "\(store.idleGPUs.count)/\(store.totalGPUCount)",
-                    color: store.idleGPUs.isEmpty ? .secondary : .green
+                    value: "\(store.totalFreeGPUCount)/\(store.totalGPUCount)",
+                    color: store.totalFreeGPUCount == 0 ? .secondary : .green
                 )
                 miniStat(
-                    title: "平均算力",
-                    value: Formatters.percent(store.totalGPUCount > 0 ? store.averageClusterGPUUtilization : nil),
-                    color: GTopTheme.utilizationColor(store.averageClusterGPUUtilization)
+                    title: store.allOnlineGPUs.isEmpty && !store.onlineSlurmHosts.isEmpty ? "Slurm 作业" : "平均算力",
+                    value: store.allOnlineGPUs.isEmpty && !store.onlineSlurmHosts.isEmpty
+                        ? "\(store.allSlurmJobs.filter { $0.job.state.isRunning }.count)R / \(store.allSlurmJobs.filter { $0.job.state.isPending }.count)PD"
+                        : Formatters.percent(store.allOnlineGPUs.isEmpty ? nil : store.averageClusterGPUUtilization),
+                    color: store.allOnlineGPUs.isEmpty && !store.onlineSlurmHosts.isEmpty
+                        ? .purple
+                        : GTopTheme.utilizationColor(store.averageClusterGPUUtilization)
                 )
             }
 
@@ -76,10 +80,19 @@ struct MenuBarContentView: View {
                                     StatusDot(status: host.status, size: 7)
 
                                     VStack(alignment: .leading, spacing: 1) {
-                                        Text(host.config.alias)
-                                            .font(.callout.weight(.medium))
-                                            .lineLimit(1)
-                                        if host.status.isOnline {
+                                        HStack(spacing: 4) {
+                                            Text(host.config.alias)
+                                                .font(.callout.weight(.medium))
+                                                .lineLimit(1)
+                                            if host.isSlurmCluster {
+                                                BadgePill(text: "Slurm", color: .purple)
+                                            }
+                                        }
+                                        if let slurm = host.slurm, host.status.isOnline {
+                                            Text("空闲 \(slurm.freeGPUs)/\(slurm.totalGPUs) 卡 · \(slurm.runningJobs.count)R/\(slurm.pendingJobs.count)PD")
+                                                .font(.caption2.monospacedDigit())
+                                                .foregroundStyle(.secondary)
+                                        } else if host.status.isOnline {
                                             Text("显存 \(Formatters.percent(host.memoryPercent)) · 空闲 \(host.idleGPUs(threshold: store.settings.idleThreshold).count)/\(host.gpus.count)")
                                                 .font(.caption2.monospacedDigit())
                                                 .foregroundStyle(.secondary)
@@ -92,7 +105,11 @@ struct MenuBarContentView: View {
 
                                     Spacer()
 
-                                    if host.status.isOnline && !host.gpus.isEmpty {
+                                    if let slurm = host.slurm, host.status.isOnline {
+                                        Text(Formatters.percent(slurm.allocationPercent))
+                                            .font(.caption.weight(.semibold).monospacedDigit())
+                                            .foregroundStyle(.purple)
+                                    } else if host.status.isOnline && !host.gpus.isEmpty {
                                         MiniGPUHeatBars(gpus: host.gpus, maxHeight: 16, barWidth: 4)
                                     }
                                 }

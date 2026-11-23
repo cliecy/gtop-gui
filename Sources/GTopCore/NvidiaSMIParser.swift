@@ -8,7 +8,7 @@ public enum NvidiaSMIParseError: Error, LocalizedError, Equatable, Sendable {
     public var errorDescription: String? {
         switch self {
         case .noNvidiaSMI:
-            return "未检测到 nvidia-smi（主机可能未安装 NVIDIA 驱动或无 GPU）"
+            return "未检测到 nvidia-smi 或 Slurm 调度系统（主机可能无 GPU 且非 Slurm 登录节点）"
         case .smiCommandFailed(let detail):
             return "nvidia-smi 执行失败：\(detail)"
         case .emptyOutput:
@@ -19,16 +19,30 @@ public enum NvidiaSMIParseError: Error, LocalizedError, Equatable, Sendable {
 
 public struct NvidiaSMIParseResult: Sendable {
     public let remoteHostname: String?
+    public let remoteUsername: String?
     public let gpus: [GPUMetric]
+    public let slurm: SlurmClusterSnapshot?
+
+    public init(
+        remoteHostname: String?,
+        remoteUsername: String? = nil,
+        gpus: [GPUMetric],
+        slurm: SlurmClusterSnapshot? = nil
+    ) {
+        self.remoteHostname = remoteHostname
+        self.remoteUsername = remoteUsername
+        self.gpus = gpus
+        self.slurm = slurm
+    }
 }
 
 public struct NvidiaSMIParser: Sendable {
+    private let slurmParser = SlurmParser()
+
     public init() {}
 
-    /// POSIX /bin/sh script sent via stdin to `/bin/sh -s` over SSH.
-    /// Avoids all remote login-shell quoting issues (fish/csh/tcsh/zsh/bash) and fetches
-    /// GPU metrics, compute/graphics processes, and per-PID user/cmdline in one round-trip.
-    public static let remoteProbeScript: String = """
+    /// Focused `nvidia-smi` only probe script (used both directly and for on-demand Slurm compute-node drill-downs).
+    public static let nvidiaSMIOnlyProbeScript: String = """
     PATH="$PATH:/usr/local/nvidia/bin:/usr/bin:/bin"
     if ! command -v nvidia-smi >/dev/null 2>&1; then
       echo "__GTOP_ERR__:NO_NVIDIA_SMI"
@@ -36,6 +50,8 @@ public struct NvidiaSMIParser: Sendable {
     fi
     echo "__GTOP_META__"
     hostname 2>/dev/null || true
+    echo "__GTOP_USER__"
+    whoami 2>/dev/null || id -un 2>/dev/null || true
     echo "__GTOP_GPUS__"
     nvidia-smi --query-gpu=index,uuid,name,driver_version,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,power.limit,fan.speed,pstate --format=csv,noheader,nounits 2>&1
     rc=$?
@@ -56,19 +72,83 @@ public struct NvidiaSMIParser: Sendable {
     echo "__GTOP_END__"
     """
 
+    /// Unified single-round-trip POSIX `/bin/sh` probe script.
+    /// Automatically detects BOTH Slurm (`sinfo` + `squeue` + `scontrol`) and local `nvidia-smi`.
+    public static let remoteProbeScript: String = """
+    PATH="$PATH:/usr/local/nvidia/bin:/usr/local/bin:/usr/bin:/bin"
+    HAS_SMI=0
+    HAS_SLURM=0
+    command -v nvidia-smi >/dev/null 2>&1 && HAS_SMI=1
+    command -v sinfo >/dev/null 2>&1 && command -v squeue >/dev/null 2>&1 && HAS_SLURM=1
+    if [ $HAS_SMI -eq 0 ] && [ $HAS_SLURM -eq 0 ]; then
+      echo "__GTOP_ERR__:NO_NVIDIA_SMI"
+      exit 0
+    fi
+    echo "__GTOP_META__"
+    hostname 2>/dev/null || true
+    echo "__GTOP_USER__"
+    whoami 2>/dev/null || id -un 2>/dev/null || true
+    if [ $HAS_SLURM -eq 1 ]; then
+      echo "__GTOP_SLURM_PRESENT__"
+      echo "__GTOP_SLURM_PARTITIONS__"
+      sinfo -h -o "%P|%a|%l" 2>/dev/null || true
+      echo "__GTOP_SLURM_NODES__"
+      SN=$(scontrol show node -o 2>/dev/null || true)
+      if [ -n "$SN" ]; then
+        printf '%s\\n' "$SN"
+      else
+        echo "__GTOP_SLURM_SINFO__"
+        sinfo -h -N -o "%N|%P|%T|%G|%C|%m|%O" 2>/dev/null || true
+      fi
+      echo "__GTOP_SLURM_JOBS_V2__"
+      if ! squeue -h -O "JobID:|,UserName:|,Partition:|,State:|,TimeUsed:|,TimeLimit:|,NodeList:|,Reason:|,tres-alloc:|,tres-per-node:|,tres-per-job:|,NumNodes:|,NumCPUs:|,Name:" 2>/dev/null; then
+        echo "__GTOP_SLURM_JOBS_V1__"
+        squeue -h -o "%i|%u|%P|%T|%M|%l|%N|%R|%b|%D|%C|%j" 2>/dev/null || true
+      fi
+    fi
+    if [ $HAS_SMI -eq 1 ]; then
+      echo "__GTOP_GPUS__"
+      nvidia-smi --query-gpu=index,uuid,name,driver_version,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,power.limit,fan.speed,pstate --format=csv,noheader,nounits 2>&1
+      rc=$?
+      if [ $rc -ne 0 ]; then
+        echo "__GTOP_SMI_RC__:$rc"
+      fi
+      echo "__GTOP_PROCS__"
+      C=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null || true)
+      [ -n "$C" ] && printf '%s\\n' "$C"
+      echo "__GTOP_GPROCS__"
+      G=$(nvidia-smi --query-graphics-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null || true)
+      [ -n "$G" ] && printf '%s\\n' "$G"
+      echo "__GTOP_PS__"
+      PIDS=$(printf '%s\\n%s\\n' "$C" "$G" | awk -F',' 'NF>=2 {gsub(/ /, "", $2); if ($2 ~ /^[0-9]+$/) print $2}' | sort -u | tr '\\n' ',' | sed 's/,$//')
+      if [ -n "$PIDS" ]; then
+        ps -o pid=,user:32=,etime=,args= -p "$PIDS" 2>/dev/null || ps -o pid=,user=,args= -p "$PIDS" 2>/dev/null || true
+      fi
+    fi
+    echo "__GTOP_END__"
+    """
+
     public func parse(output: String) throws -> NvidiaSMIParseResult {
         let lines = output.components(separatedBy: .newlines)
 
         enum Section {
-            case none, meta, gpus, computeProcs, graphicsProcs, ps
+            case none, meta, user, gpus, computeProcs, graphicsProcs, ps
+            case slurmPartitions, slurmNodes, slurmSinfo, slurmJobsV2, slurmJobsV1
         }
 
         var section: Section = .none
         var metaLines: [String] = []
+        var userLines: [String] = []
         var gpuLines: [String] = []
         var computeProcLines: [String] = []
         var graphicsProcLines: [String] = []
         var psLines: [String] = []
+        var slurmPresent = false
+        var slurmPartitionLines: [String] = []
+        var slurmNodeLines: [String] = []
+        var slurmSinfoLines: [String] = []
+        var slurmJobsV2Lines: [String] = []
+        var slurmJobsV1Lines: [String] = []
         var smiReturnCode: Int?
 
         for rawLine in lines {
@@ -85,31 +165,31 @@ public struct NvidiaSMIParser: Sendable {
             }
 
             switch trimmed {
-            case "__GTOP_META__":
-                section = .meta
-                continue
-            case "__GTOP_GPUS__":
-                section = .gpus
-                continue
-            case "__GTOP_PROCS__":
-                section = .computeProcs
-                continue
-            case "__GTOP_GPROCS__":
-                section = .graphicsProcs
-                continue
-            case "__GTOP_PS__":
-                section = .ps
-                continue
-            case "__GTOP_END__":
-                section = .none
-                continue
-            default:
-                break
+            case "__GTOP_META__": section = .meta; continue
+            case "__GTOP_USER__": section = .user; continue
+            case "__GTOP_SLURM_PRESENT__": slurmPresent = true; continue
+            case "__GTOP_SLURM_PARTITIONS__": section = .slurmPartitions; continue
+            case "__GTOP_SLURM_NODES__": section = .slurmNodes; continue
+            case "__GTOP_SLURM_SINFO__": section = .slurmSinfo; continue
+            case "__GTOP_SLURM_JOBS_V2__": section = .slurmJobsV2; continue
+            case "__GTOP_SLURM_JOBS_V1__": section = .slurmJobsV1; continue
+            case "__GTOP_GPUS__": section = .gpus; continue
+            case "__GTOP_PROCS__": section = .computeProcs; continue
+            case "__GTOP_GPROCS__": section = .graphicsProcs; continue
+            case "__GTOP_PS__": section = .ps; continue
+            case "__GTOP_END__": section = .none; continue
+            default: break
             }
 
             guard !trimmed.isEmpty else { continue }
             switch section {
             case .meta: metaLines.append(trimmed)
+            case .user: userLines.append(trimmed)
+            case .slurmPartitions: slurmPartitionLines.append(trimmed)
+            case .slurmNodes: slurmNodeLines.append(trimmed)
+            case .slurmSinfo: slurmSinfoLines.append(trimmed)
+            case .slurmJobsV2: slurmJobsV2Lines.append(trimmed)
+            case .slurmJobsV1: slurmJobsV1Lines.append(trimmed)
             case .gpus: gpuLines.append(trimmed)
             case .computeProcs: computeProcLines.append(trimmed)
             case .graphicsProcs: graphicsProcLines.append(trimmed)
@@ -118,6 +198,76 @@ public struct NvidiaSMIParser: Sendable {
             }
         }
 
+        let remoteUser = userLines.first
+
+        var slurmSnapshot: SlurmClusterSnapshot? = nil
+        if slurmPresent || !slurmNodeLines.isEmpty || !slurmSinfoLines.isEmpty {
+            let parsed = slurmParser.parse(
+                currentUser: remoteUser,
+                scontrolNodeLines: slurmNodeLines,
+                sinfoNodeFallbackLines: slurmSinfoLines,
+                partitionLines: slurmPartitionLines,
+                jobsV2Lines: slurmJobsV2Lines,
+                jobsV1Lines: slurmJobsV1Lines
+            )
+            // Treat as an active Slurm cluster if at least one node or partition was returned
+            if !parsed.nodes.isEmpty || !parsed.partitions.isEmpty {
+                slurmSnapshot = parsed
+            }
+        }
+
+        // Parse local GPUs if nvidia-smi succeeded
+        var gpus: [GPUMetric] = []
+        let smiFailed = (smiReturnCode != nil && smiReturnCode != 0) ||
+            (gpuLines.first?.localizedCaseInsensitiveContains("NVIDIA-SMI has failed") == true) ||
+            (gpuLines.first?.localizedCaseInsensitiveContains("Failed to initialize NVML") == true)
+
+        if !smiFailed && !gpuLines.isEmpty {
+            let psMap = parsePSLines(psLines)
+            var uuidToIndex: [String: Int] = [:]
+
+            for line in gpuLines {
+                if let gpu = parseGPULine(line) {
+                    uuidToIndex[gpu.uuid] = gpu.index
+                    gpus.append(gpu)
+                }
+            }
+
+            var procsByUUID: [String: [GPUProcess]] = [:]
+            for line in computeProcLines {
+                if let proc = parseProcessLine(line, type: .compute, uuidToIndex: uuidToIndex, psMap: psMap) {
+                    procsByUUID[proc.gpuUUID, default: []].append(proc)
+                }
+            }
+            for line in graphicsProcLines {
+                if let proc = parseProcessLine(line, type: .graphics, uuidToIndex: uuidToIndex, psMap: psMap) {
+                    let existing = procsByUUID[proc.gpuUUID, default: []]
+                    if !existing.contains(where: { $0.pid == proc.pid && $0.type == .graphics }) {
+                        procsByUUID[proc.gpuUUID, default: []].append(proc)
+                    }
+                }
+            }
+
+            for i in gpus.indices {
+                let uuid = gpus[i].uuid
+                gpus[i].processes = (procsByUUID[uuid] ?? []).sorted {
+                    ($0.usedMemoryMiB ?? 0) > ($1.usedMemoryMiB ?? 0)
+                }
+            }
+            gpus.sort { $0.index < $1.index }
+        }
+
+        // If we have a valid Slurm cluster (e.g., login node with no local GPUs), succeed cleanly!
+        if let slurmSnapshot {
+            return NvidiaSMIParseResult(
+                remoteHostname: metaLines.first,
+                remoteUsername: remoteUser,
+                gpus: gpus,
+                slurm: slurmSnapshot
+            )
+        }
+
+        // Otherwise require valid local nvidia-smi output
         if let rc = smiReturnCode, rc != 0 {
             let detail = gpuLines.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
             if detail.localizedCaseInsensitiveContains("No devices were found") {
@@ -130,24 +280,8 @@ public struct NvidiaSMIParser: Sendable {
             throw NvidiaSMIParseError.emptyOutput
         }
 
-        // Check if nvidia-smi printed an error message instead of CSV
-        if let first = gpuLines.first,
-           first.localizedCaseInsensitiveContains("NVIDIA-SMI has failed") ||
-           first.localizedCaseInsensitiveContains("Failed to initialize NVML")
-        {
+        if smiFailed, let first = gpuLines.first {
             throw NvidiaSMIParseError.smiCommandFailed(first)
-        }
-
-        let psMap = parsePSLines(psLines)
-
-        var gpus: [GPUMetric] = []
-        var uuidToIndex: [String: Int] = [:]
-
-        for line in gpuLines {
-            if let gpu = parseGPULine(line) {
-                uuidToIndex[gpu.uuid] = gpu.index
-                gpus.append(gpu)
-            }
         }
 
         if gpus.isEmpty {
@@ -155,35 +289,11 @@ public struct NvidiaSMIParser: Sendable {
             throw NvidiaSMIParseError.smiCommandFailed(fallbackDetail)
         }
 
-        var procsByUUID: [String: [GPUProcess]] = [:]
-        for line in computeProcLines {
-            if let proc = parseProcessLine(line, type: .compute, uuidToIndex: uuidToIndex, psMap: psMap) {
-                procsByUUID[proc.gpuUUID, default: []].append(proc)
-            }
-        }
-        for line in graphicsProcLines {
-            if let proc = parseProcessLine(line, type: .graphics, uuidToIndex: uuidToIndex, psMap: psMap) {
-                // Avoid duplicate if same PID already listed under compute on same GPU
-                let existing = procsByUUID[proc.gpuUUID, default: []]
-                if !existing.contains(where: { $0.pid == proc.pid && $0.type == .graphics }) {
-                    procsByUUID[proc.gpuUUID, default: []].append(proc)
-                }
-            }
-        }
-
-        for i in gpus.indices {
-            let uuid = gpus[i].uuid
-            let sortedProcs = (procsByUUID[uuid] ?? []).sorted {
-                ($0.usedMemoryMiB ?? 0) > ($1.usedMemoryMiB ?? 0)
-            }
-            gpus[i].processes = sortedProcs
-        }
-
-        gpus.sort { $0.index < $1.index }
-
         return NvidiaSMIParseResult(
             remoteHostname: metaLines.first,
-            gpus: gpus
+            remoteUsername: remoteUser,
+            gpus: gpus,
+            slurm: nil
         )
     }
 
@@ -225,7 +335,6 @@ public struct NvidiaSMIParser: Sendable {
         uuidToIndex: [String: Int],
         psMap: [Int: PSInfo]
     ) -> GPUProcess? {
-        // Format: gpu_uuid, pid, process_name (may theoretically contain commas), used_gpu_memory
         let rawCols = line.split(separator: ",", omittingEmptySubsequences: false)
             .map { $0.trimmingCharacters(in: .whitespaces) }
         guard rawCols.count >= 4 else { return nil }
@@ -257,13 +366,11 @@ public struct NvidiaSMIParser: Sendable {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             guard !trimmed.isEmpty else { continue }
 
-            // Split first 3 whitespace-separated fields: PID, USER, ETIME (or ARGS)
             let parts = splitLeadingFields(trimmed, count: 3)
             guard parts.count >= 3, let pid = Int(parts[0]) else { continue }
             let user = parts[1]
             let rest = parts[2]
 
-            // Detect whether 3rd token looks like ps etime (e.g., 02:15, 12:34:56, 3-04:12:01)
             let restParts = splitLeadingFields(rest, count: 2)
             if restParts.count == 2, Self.looksLikeElapsedTime(restParts[0]) {
                 result[pid] = PSInfo(user: user, elapsed: restParts[0], commandLine: restParts[1])
@@ -301,7 +408,6 @@ public struct NvidiaSMIParser: Sendable {
     }
 
     private static func looksLikeElapsedTime(_ token: String) -> Bool {
-        // Matches MM:SS, HH:MM:SS, D-HH:MM:SS
         guard token.contains(":") else { return false }
         return token.allSatisfy { $0.isNumber || $0 == ":" || $0 == "-" }
     }

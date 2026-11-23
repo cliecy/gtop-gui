@@ -33,7 +33,16 @@ struct ClusterOverviewView: View {
                 (host.config.hostName?.localizedCaseInsensitiveContains(query) ?? false) ||
                 host.effectiveGroup.localizedCaseInsensitiveContains(query) ||
                 host.gpus.contains(where: { $0.name.localizedCaseInsensitiveContains(query) }) ||
-                host.activeUsers.contains(where: { $0.localizedCaseInsensitiveContains(query) })
+                host.activeUsers.contains(where: { $0.localizedCaseInsensitiveContains(query) }) ||
+                (host.slurm?.nodes.contains(where: {
+                    $0.name.localizedCaseInsensitiveContains(query) ||
+                    $0.gpuType.localizedCaseInsensitiveContains(query)
+                }) ?? false) ||
+                (host.slurm?.partitions.contains(where: { $0.name.localizedCaseInsensitiveContains(query) }) ?? false) ||
+                (host.slurm?.jobs.contains(where: {
+                    $0.user.localizedCaseInsensitiveContains(query) ||
+                    $0.name.localizedCaseInsensitiveContains(query)
+                }) ?? false)
             }
         }
         return hosts
@@ -43,14 +52,42 @@ struct ClusterOverviewView: View {
         scopedHosts.filter { $0.status.isOnline }
     }
 
+    private var scopedSlurmHosts: [HostMonitorState] {
+        onlineScopedHosts.filter(\.isSlurmCluster)
+    }
+
     private var scopedGPUs: [(host: HostMonitorState, gpu: GPUMetric)] {
         onlineScopedHosts.flatMap { host in
             host.gpus.map { (host: host, gpu: $0) }
         }
     }
 
+    private var scopedSlurmTotalGPUs: Int {
+        scopedSlurmHosts.reduce(0) { $0 + ($1.slurm?.totalGPUs ?? 0) }
+    }
+
+    private var scopedSlurmFreeGPUs: Int {
+        scopedSlurmHosts.reduce(0) { $0 + ($1.slurm?.freeGPUs ?? 0) }
+    }
+
+    private var scopedSlurmAllocGPUs: Int {
+        scopedSlurmHosts.reduce(0) { $0 + ($1.slurm?.allocatedGPUs ?? 0) }
+    }
+
+    private var scopedTotalCombinedGPUs: Int {
+        scopedGPUs.count + scopedSlurmTotalGPUs
+    }
+
     private var scopedIdleCount: Int {
-        scopedGPUs.filter { $0.gpu.isIdle(threshold: store.settings.idleThreshold) }.count
+        scopedGPUs.filter { $0.gpu.isIdle(threshold: store.settings.idleThreshold) }.count + scopedSlurmFreeGPUs
+    }
+
+    private var scopedSlurmRunningJobs: Int {
+        scopedSlurmHosts.reduce(0) { $0 + ($1.slurm?.runningJobs.count ?? 0) }
+    }
+
+    private var scopedSlurmPendingJobs: Int {
+        scopedSlurmHosts.reduce(0) { $0 + ($1.slurm?.pendingJobs.count ?? 0) }
     }
 
     private var scopedAvgUtil: Double {
@@ -122,32 +159,61 @@ struct ClusterOverviewView: View {
                     } label: {
                         KPICard(
                             title: "空闲 GPU",
-                            value: "\(scopedIdleCount) / \(scopedGPUs.count)",
-                            subtitle: "阈值 ≤ \(Int(store.settings.idleThreshold.maxGPUUtilization))% 算力 · 点击筛选",
+                            value: "\(scopedIdleCount) / \(scopedTotalCombinedGPUs)",
+                            subtitle: scopedSlurmTotalGPUs > 0
+                                ? "直连 \(scopedGPUs.filter { $0.gpu.isIdle(threshold: store.settings.idleThreshold) }.count) + Slurm \(scopedSlurmFreeGPUs) · 点击发现"
+                                : "阈值 ≤ \(Int(store.settings.idleThreshold.maxGPUUtilization))% 算力 · 点击筛选",
                             icon: "sparkles",
                             accent: .green,
-                            progress: scopedGPUs.isEmpty ? 0 : Double(scopedIdleCount) / Double(scopedGPUs.count)
+                            progress: scopedTotalCombinedGPUs == 0 ? 0 : Double(scopedIdleCount) / Double(scopedTotalCombinedGPUs)
                         )
                     }
                     .buttonStyle(.plain)
 
-                    KPICard(
-                        title: "平均算力利用率",
-                        value: Formatters.percent(scopedGPUs.isEmpty ? nil : scopedAvgUtil),
-                        subtitle: "活跃进程 \(onlineScopedHosts.reduce(0) { $0 + $1.allProcesses.count }) 个",
-                        icon: "cpu",
-                        accent: GTopTheme.utilizationColor(scopedAvgUtil),
-                        progress: scopedAvgUtil / 100.0
-                    )
+                    if scopedGPUs.isEmpty && scopedSlurmTotalGPUs > 0 {
+                        let allocPct = Double(scopedSlurmAllocGPUs) / Double(scopedSlurmTotalGPUs) * 100.0
+                        KPICard(
+                            title: "Slurm GPU 分配率",
+                            value: Formatters.percent(allocPct),
+                            subtitle: "已分配 \(scopedSlurmAllocGPUs) / \(scopedSlurmTotalGPUs) 卡",
+                            icon: "cpu",
+                            accent: .purple,
+                            progress: allocPct / 100.0
+                        )
 
-                    KPICard(
-                        title: "总显存占用",
-                        value: Formatters.percent(scopedMemTotalMiB > 0 ? scopedMemPercent : nil),
-                        subtitle: Formatters.memoryPair(usedMiB: scopedMemUsedMiB, totalMiB: scopedMemTotalMiB),
-                        icon: "memorychip",
-                        accent: GTopTheme.memoryColor(scopedMemPercent),
-                        progress: scopedMemPercent / 100.0
-                    )
+                        Button {
+                            onSelectDestination(.slurmJobs)
+                        } label: {
+                            KPICard(
+                                title: "Slurm 作业队列",
+                                value: "\(scopedSlurmRunningJobs) R / \(scopedSlurmPendingJobs) PD",
+                                subtitle: "我的作业 \(store.mySlurmJobCount) 个 · 点击查看队列",
+                                icon: "square.stack.3d.up",
+                                accent: .purple
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        KPICard(
+                            title: "直连平均算力",
+                            value: Formatters.percent(scopedGPUs.isEmpty ? nil : scopedAvgUtil),
+                            subtitle: scopedSlurmTotalGPUs > 0
+                                ? "Slurm 作业 \(scopedSlurmRunningJobs)R/\(scopedSlurmPendingJobs)PD · 直连 \(onlineScopedHosts.reduce(0) { $0 + $1.allProcesses.count }) 进程"
+                                : "活跃进程 \(onlineScopedHosts.reduce(0) { $0 + $1.allProcesses.count }) 个",
+                            icon: "cpu",
+                            accent: GTopTheme.utilizationColor(scopedAvgUtil),
+                            progress: scopedAvgUtil / 100.0
+                        )
+
+                        KPICard(
+                            title: "直连总显存占用",
+                            value: Formatters.percent(scopedMemTotalMiB > 0 ? scopedMemPercent : nil),
+                            subtitle: Formatters.memoryPair(usedMiB: scopedMemUsedMiB, totalMiB: scopedMemTotalMiB),
+                            icon: "memorychip",
+                            accent: GTopTheme.memoryColor(scopedMemPercent),
+                            progress: scopedMemPercent / 100.0
+                        )
+                    }
                 }
 
                 if scopedHosts.isEmpty {
@@ -538,9 +604,13 @@ private struct HostOverviewCard: View {
                             .font(.headline)
                             .lineLimit(1)
 
+                        if host.isSlurmCluster {
+                            BadgePill(text: "Slurm", color: .purple, icon: "square.stack.3d.up")
+                        }
+
                         BadgePill(text: host.effectiveGroup, color: .blue)
 
-                        let idleCount = host.idleGPUs(threshold: idleThreshold).count
+                        let idleCount = host.slurm?.freeGPUs ?? host.idleGPUs(threshold: idleThreshold).count
                         if host.status.isOnline && idleCount > 0 {
                             BadgePill(text: "\(idleCount) 空闲", color: .green, icon: "sparkles")
                         }
@@ -586,7 +656,94 @@ private struct HostOverviewCard: View {
                 }
             }
 
-            if host.status.isOnline {
+            if let slurm = host.slurm, host.status.isOnline {
+                // Slurm Cluster Overview Body
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Slurm 集群 · \(slurm.gpuNodes.count) 个 GPU 节点 · 共 \(slurm.totalGPUs) 卡")
+                            .font(.caption.weight(.medium))
+                            .lineLimit(1)
+                        HStack(spacing: 10) {
+                            Label("已分配 \(slurm.allocatedGPUs)/\(slurm.totalGPUs)", systemImage: "cpu")
+                            Label("运行 \(slurm.runningJobs.count) · 排队 \(slurm.pendingJobs.count)", systemImage: "list.bullet.rectangle")
+                        }
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    MiniSparkline(
+                        samples: host.hostHistory,
+                        tint: .purple
+                    )
+                    .frame(width: 96, height: 28)
+                }
+
+                // Partition pills
+                if !slurm.partitions.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(slurm.partitions.prefix(5)) { part in
+                                BadgePill(
+                                    text: "\(part.name): \(part.freeGPUs)/\(part.totalGPUs) 空",
+                                    color: part.freeGPUs > 0 ? .green : .secondary
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Divider()
+
+                // Top GPU compute nodes compact preview
+                VStack(spacing: 6) {
+                    ForEach(slurm.gpuNodes.prefix(6)) { node in
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(GTopTheme.slurmNodeColor(node.stateCategory))
+                                .frame(width: 7, height: 7)
+                            Text(node.name)
+                                .font(.caption2.weight(.semibold))
+                                .lineLimit(1)
+                                .frame(width: 100, alignment: .leading)
+                            Text(node.gpuType)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .frame(width: 58, alignment: .leading)
+                            MetricProgressBar(
+                                fraction: node.gpuAllocationPercent / 100.0,
+                                tint: node.hasFreeGPUs ? .blue : GTopTheme.slurmNodeColor(node.stateCategory),
+                                height: 6
+                            )
+                            Text("\(node.allocatedGPUs)/\(node.totalGPUs)")
+                                .font(.caption2.monospacedDigit())
+                                .frame(width: 34, alignment: .trailing)
+                            Text(node.hasFreeGPUs ? "\(node.freeGPUs) 空" : node.stateCategory.displayName)
+                                .font(.caption2.weight(.medium).monospacedDigit())
+                                .foregroundStyle(node.hasFreeGPUs ? .green : .secondary)
+                                .frame(width: 48, alignment: .trailing)
+                        }
+                    }
+                    if slurm.gpuNodes.count > 6 {
+                        Text("还有 \(slurm.gpuNodes.count - 6) 个 GPU 计算节点…")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+
+                HStack(spacing: 6) {
+                    if !slurm.myJobs.isEmpty {
+                        BadgePill(text: "我的作业 \(slurm.myJobs.count)", color: .purple, icon: "person.fill")
+                    }
+                    Spacer()
+                    Text("点击查看完整分区 / 节点 / 作业看板 →")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.top, 2)
+            } else if host.status.isOnline {
                 // Summary Strip + Mini Sparkline
                 HStack(spacing: 12) {
                     VStack(alignment: .leading, spacing: 3) {

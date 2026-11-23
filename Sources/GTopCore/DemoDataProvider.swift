@@ -8,6 +8,14 @@ public struct DemoDataProvider: Sendable {
     public func demoHostConfigs() -> [SSHHostConfig] {
         [
             SSHHostConfig(
+                alias: "slurm-hpc-login",
+                hostName: "hpc.research.edu",
+                user: "cliecy",
+                port: 22,
+                sourceFile: "~/.ssh/conf.d/hpc-slurm.conf",
+                commentGroup: "Slurm 超算集群"
+            ),
+            SSHHostConfig(
                 alias: "gpu-h100-01",
                 hostName: "10.24.8.11",
                 user: "mlops",
@@ -61,6 +69,228 @@ public struct DemoDataProvider: Sendable {
     public func generateSnapshot(for alias: String, tick: Int) -> Result<HostPollSnapshot, Error> {
         let phase = Double(tick) * 0.35
         switch alias {
+        case "slurm-hpc-login":
+            let dynamicAlloc = (tick / 4) % 2 == 0 ? 4 : 6
+            let nodes: [SlurmNodeMetric] = [
+                SlurmNodeMetric(
+                    name: "hpc-h100-01",
+                    partitions: ["h100-prod", "gpu-all"],
+                    rawState: "ALLOCATED",
+                    stateCategory: .allocated,
+                    gpuType: "H100",
+                    totalGPUs: 8,
+                    allocatedGPUs: 8,
+                    gpuBreakdown: [SlurmGPUTypeCount(type: "H100", total: 8, allocated: 8)],
+                    cpusAllocated: 112,
+                    cpusTotal: 128,
+                    cpuLoad: 64.2,
+                    memoryAllocatedMiB: 900_000,
+                    memoryTotalMiB: 1_024_000
+                ),
+                SlurmNodeMetric(
+                    name: "hpc-h100-02",
+                    partitions: ["h100-prod", "gpu-all"],
+                    rawState: "MIXED",
+                    stateCategory: .mixed,
+                    gpuType: "H100",
+                    totalGPUs: 8,
+                    allocatedGPUs: dynamicAlloc,
+                    gpuBreakdown: [SlurmGPUTypeCount(type: "H100", total: 8, allocated: dynamicAlloc)],
+                    cpusAllocated: 48,
+                    cpusTotal: 128,
+                    cpuLoad: 28.5,
+                    memoryAllocatedMiB: 420_000,
+                    memoryTotalMiB: 1_024_000
+                ),
+                SlurmNodeMetric(
+                    name: "hpc-a100-01",
+                    partitions: ["a100-lab", "gpu-all"],
+                    rawState: "MIXED",
+                    stateCategory: .mixed,
+                    gpuType: "A100",
+                    totalGPUs: 8,
+                    allocatedGPUs: 2,
+                    gpuBreakdown: [SlurmGPUTypeCount(type: "A100", total: 8, allocated: 2)],
+                    cpusAllocated: 16,
+                    cpusTotal: 128,
+                    cpuLoad: 11.8,
+                    memoryAllocatedMiB: 128_000,
+                    memoryTotalMiB: 512_000
+                ),
+                SlurmNodeMetric(
+                    name: "hpc-a100-02",
+                    partitions: ["a100-lab", "gpu-all"],
+                    rawState: "IDLE",
+                    stateCategory: .idle,
+                    gpuType: "A100",
+                    totalGPUs: 8,
+                    allocatedGPUs: 0,
+                    gpuBreakdown: [SlurmGPUTypeCount(type: "A100", total: 8, allocated: 0)],
+                    cpusAllocated: 0,
+                    cpusTotal: 128,
+                    cpuLoad: 0.12,
+                    memoryAllocatedMiB: 0,
+                    memoryTotalMiB: 512_000
+                ),
+                SlurmNodeMetric(
+                    name: "hpc-a100-03",
+                    partitions: ["a100-lab"],
+                    rawState: "IDLE+DRAIN",
+                    stateCategory: .draining,
+                    reason: "NVLink cable maintenance [admin@2026-11-22]",
+                    gpuType: "A100",
+                    totalGPUs: 8,
+                    allocatedGPUs: 0,
+                    gpuBreakdown: [SlurmGPUTypeCount(type: "A100", total: 8, allocated: 0)],
+                    cpusAllocated: 0,
+                    cpusTotal: 128,
+                    cpuLoad: 0.05,
+                    memoryAllocatedMiB: 0,
+                    memoryTotalMiB: 512_000
+                )
+            ]
+
+            let partitions: [SlurmPartitionSummary] = [
+                SlurmPartitionSummary(
+                    name: "gpu-all",
+                    isDefault: true,
+                    availability: "up",
+                    timeLimit: "7-00:00:00",
+                    totalNodes: 4,
+                    availableNodes: 4,
+                    totalGPUs: 32,
+                    allocatedGPUs: 10 + dynamicAlloc,
+                    freeGPUs: 22 - dynamicAlloc,
+                    gpuTypes: ["A100", "H100"]
+                ),
+                SlurmPartitionSummary(
+                    name: "h100-prod",
+                    isDefault: false,
+                    availability: "up",
+                    timeLimit: "3-00:00:00",
+                    totalNodes: 2,
+                    availableNodes: 2,
+                    totalGPUs: 16,
+                    allocatedGPUs: 8 + dynamicAlloc,
+                    freeGPUs: 8 - dynamicAlloc,
+                    gpuTypes: ["H100"]
+                ),
+                SlurmPartitionSummary(
+                    name: "a100-lab",
+                    isDefault: false,
+                    availability: "up",
+                    timeLimit: "14-00:00:00",
+                    totalNodes: 3,
+                    availableNodes: 2,
+                    totalGPUs: 24,
+                    allocatedGPUs: 2,
+                    freeGPUs: 14,
+                    gpuTypes: ["A100"]
+                )
+            ]
+
+            let jobs: [SlurmJobMetric] = [
+                SlurmJobMetric(
+                    jobID: "842105",
+                    user: "cliecy",
+                    name: "rlhf-qwen-32b",
+                    partition: "h100-prod",
+                    rawState: "RUNNING",
+                    state: .running,
+                    elapsedTime: "04:22:18",
+                    timeLimit: "2-00:00:00",
+                    nodeListRaw: "hpc-h100-02",
+                    expandedNodes: ["hpc-h100-02"],
+                    reason: "",
+                    gpuCount: 4,
+                    gpuType: "H100",
+                    numNodes: 1,
+                    numCPUs: 48
+                ),
+                SlurmJobMetric(
+                    jobID: "842091",
+                    user: "alice",
+                    name: "pretrain-v3-stage2",
+                    partition: "h100-prod",
+                    rawState: "RUNNING",
+                    state: .running,
+                    elapsedTime: "1-14:09:42",
+                    timeLimit: "3-00:00:00",
+                    nodeListRaw: "hpc-h100-01",
+                    expandedNodes: ["hpc-h100-01"],
+                    reason: "",
+                    gpuCount: 8,
+                    gpuType: "H100",
+                    numNodes: 1,
+                    numCPUs: 112
+                ),
+                SlurmJobMetric(
+                    jobID: "842119",
+                    user: "bob",
+                    name: "vllm-eval-suite",
+                    partition: "a100-lab",
+                    rawState: "RUNNING",
+                    state: .running,
+                    elapsedTime: "01:12:05",
+                    timeLimit: "12:00:00",
+                    nodeListRaw: "hpc-a100-01",
+                    expandedNodes: ["hpc-a100-01"],
+                    reason: "",
+                    gpuCount: 2,
+                    gpuType: "A100",
+                    numNodes: 1,
+                    numCPUs: 16
+                ),
+                SlurmJobMetric(
+                    jobID: "842130",
+                    user: "cliecy",
+                    name: "grpo-ablation-16gpu",
+                    partition: "h100-prod",
+                    rawState: "PENDING",
+                    state: .pending,
+                    elapsedTime: "0:00",
+                    timeLimit: "2-00:00:00",
+                    nodeListRaw: "",
+                    expandedNodes: [],
+                    reason: "(Resources)",
+                    gpuCount: 16,
+                    gpuType: "H100",
+                    numNodes: 2,
+                    numCPUs: 192
+                ),
+                SlurmJobMetric(
+                    jobID: "842134",
+                    user: "charlie",
+                    name: "diffusion-sft",
+                    partition: "h100-prod",
+                    rawState: "PENDING",
+                    state: .pending,
+                    elapsedTime: "0:00",
+                    timeLimit: "1-00:00:00",
+                    nodeListRaw: "",
+                    expandedNodes: [],
+                    reason: "(Priority)",
+                    gpuCount: 8,
+                    gpuType: "H100",
+                    numNodes: 1,
+                    numCPUs: 64
+                )
+            ]
+
+            let slurmSnapshot = SlurmClusterSnapshot(
+                currentUser: "cliecy",
+                nodes: nodes,
+                partitions: partitions,
+                jobs: jobs
+            )
+            return .success(HostPollSnapshot(
+                remoteHostname: "login01.hpc.research.edu",
+                remoteUsername: "cliecy",
+                gpus: [],
+                slurm: slurmSnapshot,
+                latencyMs: 31 + (tick % 6)
+            ))
+
         case "gpu-h100-01":
             let gpus: [GPUMetric] = (0..<8).map { idx in
                 let isBusy = idx < 5
@@ -211,5 +441,61 @@ public struct DemoDataProvider: Sendable {
         default:
             return .failure(NvidiaSMIParseError.noNvidiaSMI)
         }
+    }
+
+    public func generateDemoSlurmNodeLiveSnapshot(
+        nodeName: String,
+        jobID: String?,
+        tick: Int
+    ) -> SlurmLiveNodeSnapshot {
+        let phase = Double(tick) * 0.45
+        let isH100 = nodeName.localizedCaseInsensitiveContains("h100")
+        let isIdleNode = nodeName.hasSuffix("02") && !isH100
+        let count = jobID != nil ? 4 : 8
+        let gpus: [GPUMetric] = (0..<count).map { idx in
+            let busy = !isIdleNode && (idx < 4 || nodeName.hasSuffix("01"))
+            let wave = sin(phase + Double(idx) * 0.8) * 7.0
+            let util = busy ? min(100, max(65, 88 + wave)) : 0
+            let memUsed: Double = busy ? (64200 + Double(idx) * 1200) : 14
+            let procs: [GPUProcess] = busy ? [
+                GPUProcess(
+                    gpuUUID: "SLURM-\(nodeName)-\(idx)",
+                    gpuIndex: idx,
+                    pid: 71000 + idx,
+                    type: .compute,
+                    user: jobID == "842105" || nodeName == "hpc-h100-02" ? "cliecy" : "alice",
+                    processName: "/opt/conda/bin/python3",
+                    commandLine: jobID == "842105" || nodeName == "hpc-h100-02"
+                        ? "torchrun --nproc_per_node=4 train_rlhf.py --model qwen-32b"
+                        : "deepspeed --num_gpus=8 pretrain_v3.py --stage 2",
+                    usedMemoryMiB: memUsed - 400,
+                    elapsedTime: "04:22:18"
+                )
+            ] : []
+
+            return GPUMetric(
+                index: idx,
+                uuid: "SLURM-\(nodeName)-\(idx)",
+                name: isH100 ? "NVIDIA H100 80GB HBM3" : "NVIDIA A100-SXM4-80GB",
+                driverVersion: "550.90.07",
+                gpuUtilization: util,
+                memoryUtilization: busy ? min(100, util * 0.85) : 0,
+                memoryUsedMiB: memUsed,
+                memoryTotalMiB: 81559,
+                temperatureC: busy ? 66 + wave * 0.35 : 32,
+                powerDrawW: busy ? (isH100 ? 560 : 310) + wave * 6 : 58,
+                powerLimitW: isH100 ? 700 : 400,
+                fanSpeedPercent: nil,
+                pstate: busy ? "P0" : "P8",
+                processes: procs
+            )
+        }
+        return SlurmLiveNodeSnapshot(
+            nodeName: nodeName,
+            jobID: jobID,
+            method: .demo,
+            gpus: gpus,
+            latencyMs: 42 + (tick % 11)
+        )
     }
 }

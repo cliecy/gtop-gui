@@ -120,6 +120,13 @@ struct MainWindowView: View {
                 onSelectHost: { coordinator.selection = .host($0) },
                 onNotify: showToast
             )
+        case .slurmJobs:
+            SlurmJobsView(
+                store: store,
+                searchText: searchText,
+                onSelectHost: { coordinator.selection = .host($0) },
+                onNotify: showToast
+            )
         case .allProcesses:
             AllProcessesView(
                 store: store,

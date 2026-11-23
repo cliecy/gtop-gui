@@ -230,18 +230,24 @@ public struct GPUSamplePoint: Identifiable, Hashable, Sendable {
 
 public struct HostPollSnapshot: Sendable {
     public let remoteHostname: String?
+    public let remoteUsername: String?
     public let gpus: [GPUMetric]
+    public let slurm: SlurmClusterSnapshot?
     public let latencyMs: Int
     public let timestamp: Date
 
     public init(
         remoteHostname: String?,
+        remoteUsername: String? = nil,
         gpus: [GPUMetric],
+        slurm: SlurmClusterSnapshot? = nil,
         latencyMs: Int,
         timestamp: Date = Date()
     ) {
         self.remoteHostname = remoteHostname
+        self.remoteUsername = remoteUsername
         self.gpus = gpus
+        self.slurm = slurm
         self.latencyMs = latencyMs
         self.timestamp = timestamp
     }
@@ -282,7 +288,9 @@ public struct HostMonitorState: Identifiable, Sendable {
     public var config: SSHHostConfig
     public var status: HostConnectionStatus
     public var remoteHostname: String?
+    public var remoteUsername: String?
     public var gpus: [GPUMetric]
+    public var slurm: SlurmClusterSnapshot?
     public var historyByGPU: [String: [GPUSamplePoint]]
     public var hostHistory: [GPUSamplePoint]
     public var lastUpdated: Date?
@@ -297,7 +305,9 @@ public struct HostMonitorState: Identifiable, Sendable {
         config: SSHHostConfig,
         status: HostConnectionStatus = .idle,
         remoteHostname: String? = nil,
+        remoteUsername: String? = nil,
         gpus: [GPUMetric] = [],
+        slurm: SlurmClusterSnapshot? = nil,
         historyByGPU: [String: [GPUSamplePoint]] = [:],
         hostHistory: [GPUSamplePoint] = [],
         lastUpdated: Date? = nil,
@@ -311,7 +321,9 @@ public struct HostMonitorState: Identifiable, Sendable {
         self.config = config
         self.status = status
         self.remoteHostname = remoteHostname
+        self.remoteUsername = remoteUsername
         self.gpus = gpus
+        self.slurm = slurm
         self.historyByGPU = historyByGPU
         self.hostHistory = hostHistory
         self.lastUpdated = lastUpdated
@@ -321,6 +333,24 @@ public struct HostMonitorState: Identifiable, Sendable {
         self.effectiveGroup = effectiveGroup
         self.matchReason = matchReason
         self.matchedRuleID = matchedRuleID
+    }
+
+    public var isSlurmCluster: Bool {
+        slurm != nil
+    }
+
+    public var totalManagedGPUCount: Int {
+        if let slurm, slurm.totalGPUs > 0 {
+            return slurm.totalGPUs
+        }
+        return gpus.count
+    }
+
+    public var effectiveLoadPercent: Double {
+        if let slurm, slurm.totalGPUs > 0 {
+            return slurm.allocationPercent
+        }
+        return averageGPUUtilization
     }
 
     public var averageGPUUtilization: Double {

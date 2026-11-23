@@ -5,9 +5,18 @@ import SwiftUI
 enum SidebarDestination: Hashable {
     case overview
     case idleGPUs
+    case slurmJobs
     case allProcesses
     case group(String)
     case host(String)
+}
+
+struct SlurmLiveProbeTarget: Identifiable, Hashable {
+    let id = UUID()
+    let loginAlias: String
+    let nodeName: String
+    let jobID: String?
+    let subtitle: String
 }
 
 enum GTopTheme {
@@ -46,6 +55,25 @@ enum GTopTheme {
         case .noGPU: return Color(nsColor: .systemYellow)
         case .error: return Color(nsColor: .systemRed)
         case .idle, .paused: return Color(nsColor: .systemGray)
+        }
+    }
+
+    static func slurmNodeColor(_ category: SlurmNodeStateCategory) -> Color {
+        switch category {
+        case .idle: return Color(nsColor: .systemGreen)
+        case .mixed: return Color(nsColor: .systemBlue)
+        case .allocated: return Color(nsColor: .systemOrange)
+        case .draining, .down: return Color(nsColor: .systemRed)
+        case .other: return Color(nsColor: .systemGray)
+        }
+    }
+
+    static func slurmJobColor(_ state: SlurmJobState) -> Color {
+        switch state {
+        case .running: return Color(nsColor: .systemGreen)
+        case .pending: return Color(nsColor: .systemOrange)
+        case .completing: return Color(nsColor: .systemBlue)
+        case .other: return Color(nsColor: .systemGray)
         }
     }
 

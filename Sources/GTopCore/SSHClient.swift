@@ -33,12 +33,14 @@ public final class SSHClient: Sendable {
     private let controlDir: String
     private let ioDir: String
     private let probeScriptPath: String
+    private let smiOnlyScriptPath: String
 
     public init() {
         let uid = getuid()
         self.controlDir = "/tmp/gtop-ssh-\(uid)"
         self.ioDir = "/tmp/gtop-ssh-\(uid)/io"
         self.probeScriptPath = "/tmp/gtop-ssh-\(uid)/probe.sh"
+        self.smiOnlyScriptPath = "/tmp/gtop-ssh-\(uid)/smi-only.sh"
 
         let fm = FileManager.default
         try? fm.createDirectory(
@@ -57,7 +59,8 @@ public final class SSHClient: Sendable {
                 try? fm.removeItem(atPath: "\(ioDir)/\(item)")
             }
         }
-        Self.ensureProbeScript(at: probeScriptPath)
+        Self.ensureScript(NvidiaSMIParser.remoteProbeScript, at: probeScriptPath)
+        Self.ensureScript(NvidiaSMIParser.nvidiaSMIOnlyProbeScript, at: smiOnlyScriptPath)
     }
 
     public func pollHost(
@@ -65,30 +68,13 @@ public final class SSHClient: Sendable {
         sshConfigPath: String,
         timeoutSeconds: Double
     ) async throws -> HostPollSnapshot {
-        Self.ensureProbeScript(at: probeScriptPath)
+        Self.ensureScript(NvidiaSMIParser.remoteProbeScript, at: probeScriptPath)
 
-        let expandedConfig = SSHConfigParser.expandTilde(sshConfigPath)
-        let connectTimeout = max(3, min(Int(timeoutSeconds) - 1, 6))
-        let controlPath = "\(controlDir)/%C"
-
-        var args: [String] = []
-        if FileManager.default.fileExists(atPath: expandedConfig) {
-            args += ["-F", expandedConfig]
-        }
-        args += [
-            "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=\(connectTimeout)",
-            "-o", "ServerAliveInterval=10",
-            "-o", "ServerAliveCountMax=2",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ControlMaster=auto",
-            "-o", "ControlPersist=90s",
-            "-o", "ControlPath=\(controlPath)",
-            "-o", "ClearAllForwardings=yes",
-            alias,
-            "/bin/sh", "-s"
-        ]
+        let args = buildSSHBaseArgs(
+            alias: alias,
+            sshConfigPath: sshConfigPath,
+            timeoutSeconds: timeoutSeconds
+        ) + ["/bin/sh", "-s"]
 
         let start = Date()
         let result = try await runSubprocess(
@@ -116,10 +102,132 @@ public final class SSHClient: Sendable {
         let parsed = try parser.parse(output: stdout)
         return HostPollSnapshot(
             remoteHostname: parsed.remoteHostname,
+            remoteUsername: parsed.remoteUsername,
             gpus: parsed.gpus,
+            slurm: parsed.slurm,
             latencyMs: elapsedMs,
             timestamp: Date()
         )
+    }
+
+    /// On-demand live `nvidia-smi` probe for a Slurm compute node (or inside a specific running job).
+    /// Tries `srun --jobid=<id> --overlap` first when a jobID is given, falling back to compute-node SSH
+    /// from the login node (or vice versa when probing a bare node).
+    public func probeSlurmNodeLiveGPU(
+        loginAlias: String,
+        nodeName: String,
+        jobID: String?,
+        sshConfigPath: String,
+        timeoutSeconds: Double
+    ) async throws -> SlurmLiveNodeSnapshot {
+        Self.ensureScript(NvidiaSMIParser.nvidiaSMIOnlyProbeScript, at: smiOnlyScriptPath)
+        guard Self.isSafeSlurmToken(nodeName) else {
+            throw SSHClientError.connectionFailed("非法的计算节点名称：\(nodeName)")
+        }
+        if let jobID, !Self.isSafeSlurmToken(jobID) {
+            throw SSHClientError.connectionFailed("非法的作业 ID：\(jobID)")
+        }
+
+        let baseArgs = buildSSHBaseArgs(
+            alias: loginAlias,
+            sshConfigPath: sshConfigPath,
+            timeoutSeconds: timeoutSeconds
+        )
+
+        var attempts: [(method: SlurmLiveProbeMethod, remoteCmd: String)] = []
+        if let jobID {
+            attempts.append((
+                .srunOverlap,
+                "srun --jobid=\(jobID) --overlap --nodes=1 --ntasks=1 -w \(nodeName) /bin/sh -s"
+            ))
+            attempts.append((
+                .directNodeSSH,
+                "ssh -T -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \(nodeName) /bin/sh -s"
+            ))
+        } else {
+            attempts.append((
+                .directNodeSSH,
+                "ssh -T -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \(nodeName) /bin/sh -s"
+            ))
+        }
+
+        var lastError: Error?
+        for attempt in attempts {
+            let start = Date()
+            do {
+                let result = try await runSubprocess(
+                    executablePath: "/usr/bin/ssh",
+                    arguments: baseArgs + [attempt.remoteCmd],
+                    stdinFilePath: smiOnlyScriptPath,
+                    timeoutSeconds: timeoutSeconds
+                )
+                let elapsedMs = max(1, Int(Date().timeIntervalSince(start) * 1000))
+                let stdout = String(data: result.stdout, encoding: .utf8) ?? ""
+                let stderr = String(data: result.stderr, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+                if stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let msg = Self.summarizeSSHStderr(stderr, exitCode: result.exitCode)
+                    lastError = SSHClientError.connectionFailed(msg)
+                    continue
+                }
+
+                let parsed = try parser.parse(output: stdout)
+                return SlurmLiveNodeSnapshot(
+                    nodeName: nodeName,
+                    jobID: jobID,
+                    method: attempt.method,
+                    gpus: parsed.gpus,
+                    latencyMs: elapsedMs,
+                    timestamp: Date()
+                )
+            } catch {
+                lastError = error
+            }
+        }
+
+        let detail = lastError?.localizedDescription ?? "无法连接到计算节点 \(nodeName)"
+        if jobID == nil && (detail.localizedCaseInsensitiveContains("Permission denied") || detail.localizedCaseInsensitiveContains("Access denied")) {
+            throw SSHClientError.authenticationFailed(
+                "集群限制直接 SSH 登录计算节点 \(nodeName)（\(detail)）。若你在此节点有运行中的作业，请从作业列表点击该作业通过 srun --overlap 探测。"
+            )
+        }
+        throw lastError ?? SSHClientError.connectionFailed(detail)
+    }
+
+    private func buildSSHBaseArgs(
+        alias: String,
+        sshConfigPath: String,
+        timeoutSeconds: Double
+    ) -> [String] {
+        let expandedConfig = SSHConfigParser.expandTilde(sshConfigPath)
+        let connectTimeout = max(3, min(Int(timeoutSeconds) - 1, 6))
+        let controlPath = "\(controlDir)/%C"
+
+        var args: [String] = []
+        if FileManager.default.fileExists(atPath: expandedConfig) {
+            args += ["-F", expandedConfig]
+        }
+        args += [
+            "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=\(connectTimeout)",
+            "-o", "ServerAliveInterval=10",
+            "-o", "ServerAliveCountMax=2",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=90s",
+            "-o", "ControlPath=\(controlPath)",
+            "-o", "ClearAllForwardings=yes",
+            alias
+        ]
+        return args
+    }
+
+    private static func isSafeSlurmToken(_ token: String) -> Bool {
+        !token.isEmpty && token.allSatisfy { ch in
+            ch.isLetter || ch.isNumber || ch == "-" || ch == "_" || ch == "."
+        }
     }
 
     public func closeControlMaster(alias: String, sshConfigPath: String) {
@@ -147,7 +255,7 @@ public final class SSHClient: Sendable {
         guard let entries = try? FileManager.default.contentsOfDirectory(atPath: controlDir) else {
             return
         }
-        for entry in entries where entry != "io" && entry != "probe.sh" {
+        for entry in entries where entry != "io" && entry != "probe.sh" && entry != "smi-only.sh" {
             let socketPath = "\(controlDir)/\(entry)"
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
@@ -300,8 +408,8 @@ public final class SSHClient: Sendable {
         }
     }
 
-    private static func ensureProbeScript(at path: String) {
-        let data = Data(NvidiaSMIParser.remoteProbeScript.utf8)
+    private static func ensureScript(_ script: String, at path: String) {
+        let data = Data(script.utf8)
         let fm = FileManager.default
         if let existing = try? Data(contentsOf: URL(fileURLWithPath: path)), existing == data {
             return

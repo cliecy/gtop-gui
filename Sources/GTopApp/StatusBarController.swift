@@ -64,7 +64,7 @@ final class StatusBarController: NSObject {
         withObservationTracking {
             _ = store.settings.showMenuBarExtra
             _ = store.totalGPUCount
-            _ = store.idleGPUs.count
+            _ = store.totalFreeGPUCount
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.isTracking else { return }
@@ -92,7 +92,7 @@ final class StatusBarController: NSObject {
             }
             if let button = statusItem?.button {
                 let total = store.totalGPUCount
-                let newTitle = total > 0 ? " \(store.idleGPUs.count)/\(total)" : ""
+                let newTitle = total > 0 ? " \(store.totalFreeGPUCount)/\(total)" : ""
                 if button.title != newTitle {
                     button.title = newTitle
                 }
