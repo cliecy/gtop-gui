@@ -29,9 +29,9 @@ if [[ -n "${GTOP_SWIFT_FLAGS:-}" ]]; then
     # shellcheck disable=SC2206
     EXTRA_FLAGS+=(${GTOP_SWIFT_FLAGS})
 fi
-swift build -c release --product GTop "${EXTRA_FLAGS[@]}"
+swift build -c release --product GTop ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}
 
-BIN_PATH="$(swift build -c release --show-bin-path "${EXTRA_FLAGS[@]}")/GTop"
+BIN_PATH="$(swift build -c release --show-bin-path ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"})/GTop"
 if [[ ! -x "$BIN_PATH" ]]; then
     echo "Error: compiled binary not found at $BIN_PATH" >&2
     exit 1
