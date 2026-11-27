@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-dmg:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - name: Build DMG
+        run: ./scripts/build-dmg.sh "${GITHUB_REF_NAME#v}"
+      - name: Upload DMG as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GTop-dmg
+          path: dist/GTop-*.dmg
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/GTop-*.dmg
+          generate_release_notes: true
